@@ -37,6 +37,9 @@ GITHUB_API = "https://api.github.com"
 DB_PATH = Path("data/database.sqlite")
 RUN_SECONDS = 10 * 60
 HANDOFF_AT_SECONDS = 8 * 60
+# Begin the final database sync 90 seconds before this test run ends.
+# For production, use RUN_SECONDS = 350 * 60 and a 300-second cutover buffer.
+CUTOVER_BUFFER_SECONDS = 90
 POLL_INTERVAL_SECONDS = 3
 START_TIME = time.monotonic()
 
@@ -47,6 +50,7 @@ DB_OWNER = ""
 DB_BRANCH = "main"
 TARGET_RUN_ID = ""
 PREPARED_FOR_HANDOFF = False
+LAST_SWITCH_NOTICE = {}
 
 
 def log_uptime():
@@ -454,12 +458,25 @@ async def save_user(message: Message, is_start=False):
     return status
 
 
+async def send_switching_notice(message: Message):
+    """Rate-limit maintenance replies per chat so message bursts cannot flood Telegram."""
+    chat_id = message.chat.id
+    now = time.monotonic()
+    if now - LAST_SWITCH_NOTICE.get(chat_id, 0.0) < 5:
+        return
+    LAST_SWITCH_NOTICE[chat_id] = now
+    try:
+        await message.answer("🔄 SkyGen server is restarting. Please wait a moment and try again.")
+    except Exception as error:
+        logging.warning("Could not send switching notice (%s).", type(error).__name__)
+
+
 async def command_start(message: Message):
     status = await save_user(message, is_start=True)
     if status is None:
         return
     if status == "switching":
-        await message.answer("🔄 SkyGen is switching servers. Please wait a moment and try again.")
+        await send_switching_notice(message)
         return
     user = message.from_user
     name = (user.first_name or "there") if user else "there"
@@ -479,7 +496,7 @@ async def command_ping(message: Message):
     if status is None:
         return
     if status == "switching":
-        await message.answer("🔄 SkyGen is switching servers. Please wait a moment.")
+        await send_switching_notice(message)
         return
     sent = await message.answer("🏓 Measuring...")
     latency = (time.perf_counter() - started) * 1000
@@ -500,15 +517,22 @@ async def command_id(message: Message):
     if status is None:
         return
     if status == "switching":
-        await message.answer("🔄 SkyGen is switching servers. Please wait a moment.")
+        await send_switching_notice(message)
         return
     if message.from_user:
         await message.answer(f"🆔 Your Telegram user ID: {message.from_user.id}")
 
 
+async def switching_fallback(message: Message):
+    """During handoff, acknowledge non-command messages instead of silently ignoring them."""
+    if HANDOFF_STARTED:
+        await send_switching_notice(message)
+
+
 dp.message.register(command_start, CommandStart())
 dp.message.register(command_ping, Command("ping"))
 dp.message.register(command_id, Command("id"))
+dp.message.register(switching_fallback)
 
 
 def exception_has_conflict(error):
@@ -542,12 +566,20 @@ async def handoff_task():
         async with aiohttp.ClientSession(timeout=timeout) as http:
             # Dispatch early, but do NOT pause handlers or polling yet.
             await write_handoff_status(http, "dispatching", "", RUN_ID)
+            # Announce maintenance as soon as dispatch starts, not after GitHub has
+            # finished locating the child Run ID. Polling stays active in this parent.
+            HANDOFF_STARTED = True
+            logging.info("SKYGEN_HANDOFF_USER_NOTICE enabled=true parent_run_id=%s", RUN_ID)
             TARGET_RUN_ID = await dispatch_next_run(http)
+            logging.info(
+                "SKYGEN_HANDOFF_TARGET target_run_id=%s parent_run_id=%s",
+                TARGET_RUN_ID, RUN_ID,
+            )
             await write_handoff_status(http, "handoff_requested", TARGET_RUN_ID, RUN_ID)
             logging.info("SKYGEN_HANDOFF_TARGET run_id=%s", TARGET_RUN_ID)
 
             hard_deadline = START_TIME + RUN_SECONDS
-            cutover_at = START_TIME + (RUN_SECONDS - 20)
+            cutover_at = START_TIME + max(0, RUN_SECONDS - CUTOVER_BUFFER_SECONDS)
             child_prepared = False
 
             # Keep the old bot fully operational while GitHub queues and starts the child.
