@@ -35,11 +35,11 @@ PARENT_RUN_ID = os.getenv("PARENT_RUN_ID", "").strip()
 
 GITHUB_API = "https://api.github.com"
 DB_PATH = Path("data/database.sqlite")
-RUN_SECONDS = 10 * 60
-HANDOFF_AT_SECONDS = 8 * 60
+RUN_SECONDS = 340 * 60
+HANDOFF_AT_SECONDS = 332 * 60
 # Begin the final database sync 90 seconds before this test run ends.
 # For production, use RUN_SECONDS = 350 * 60 and a 300-second cutover buffer.
-CUTOVER_BUFFER_SECONDS = 90
+CUTOVER_BUFFER_SECONDS = 300
 POLL_INTERVAL_SECONDS = 3
 START_TIME = time.monotonic()
 
