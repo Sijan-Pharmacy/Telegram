@@ -1,8 +1,14 @@
 name: Run SkyGen Telegram Bot
 
 on:
-  # Start the first run manually. Each run dispatches the next one itself.
+  # Start the first run manually. Subsequent runs are dispatched after a safe handoff.
   workflow_dispatch:
+    inputs:
+      parent_run_id:
+        description: "Previous run ID (set automatically during handoff)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -32,6 +38,7 @@ jobs:
           DB_REPO_NAME: ${{ secrets.DB_REPO_NAME }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PARENT_RUN_ID: ${{ inputs.parent_run_id }}
           WORKFLOW_FILE: run.yml
         run: python bot.py
-        
