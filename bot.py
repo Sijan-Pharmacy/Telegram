@@ -368,40 +368,72 @@ async def inspect_run_logs(http, run_id):
 
 
 async def child_wait_for_parent_to_stop(http):
-    """Do not start Telegram polling until the previous run has stopped polling."""
+    """Wait for the parent's final DB snapshot, reload it, then wait for poller handoff."""
     if not PARENT_RUN_ID:
         return
 
     logging.info("SKYGEN_HANDOFF_WAIT parent_run_id=%s", PARENT_RUN_ID)
     deadline = time.monotonic() + 12 * 60
+    final_db_loaded = False
+
     while time.monotonic() < deadline:
         status = await read_handoff_status(http)
+        state = status.get("state")
+        target = str(status.get("target_run_id", ""))
+        parent_id = str(status.get("parent_run_id", ""))
+
         if (
-            status.get("state") == "parent_stopped"
-            and str(status.get("target_run_id")) == RUN_ID
-            and str(status.get("parent_run_id")) == PARENT_RUN_ID
+            state == "final_snapshot_ready"
+            and target == RUN_ID
+            and parent_id == PARENT_RUN_ID
+            and not final_db_loaded
+        ):
+            # The child initially loaded an earlier snapshot at startup. Replace it with
+            # the parent's final, write-paused snapshot before becoming eligible to poll.
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{DB_PATH}{suffix}").unlink(missing_ok=True)
+            await download_database(http, DB_OWNER, DB_REPO_NAME, DB_BRANCH)
+            await write_handoff_status(
+                http, "child_ready", RUN_ID, PARENT_RUN_ID
+            )
+            final_db_loaded = True
+            logging.info("SKYGEN_CHILD_FINAL_DB_LOADED run_id=%s", RUN_ID)
+            continue
+
+        if (
+            state == "parent_stopped"
+            and target == RUN_ID
+            and parent_id == PARENT_RUN_ID
+            and final_db_loaded
         ):
             logging.info("SKYGEN_PARENT_STOP_CONFIRMED parent_run_id=%s", PARENT_RUN_ID)
             return
 
         parent = await get_workflow_run(http, PARENT_RUN_ID)
         if parent.get("status") == "completed":
-            logging.warning("Parent run completed without stop marker; safe to start polling now.")
+            if not final_db_loaded:
+                logging.warning("Parent completed before final marker; refreshing database before polling.")
+                for suffix in ("", "-wal", "-shm"):
+                    Path(f"{DB_PATH}{suffix}").unlink(missing_ok=True)
+                await download_database(http, DB_OWNER, DB_REPO_NAME, DB_BRANCH)
+            logging.warning("Parent run is completed; starting child poller after database refresh.")
             return
+
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-    # Fail closed: don't create another Telegram poller if parent status cannot be verified.
     raise RuntimeError("Timed out waiting for previous run to stop; refusing to start polling.")
 
 
 async def save_user(message: Message, is_start=False):
     """Return 'new', 'old', or None if writes are paused during handoff."""
-    if HANDOFF_STARTED or not message.from_user:
+    if not message.from_user:
         return None
+    if HANDOFF_STARTED:
+        return "switching"
     user = message.from_user
     async with DB_LOCK:
         if HANDOFF_STARTED:
-            return None
+            return "switching"
         with sqlite3.connect(DB_PATH, timeout=30) as connection:
             exists = connection.execute("SELECT 1 FROM users WHERE user_id = ?", (user.id,)).fetchone()
             status = "old" if exists else "new"
@@ -425,7 +457,9 @@ async def save_user(message: Message, is_start=False):
 async def command_start(message: Message):
     status = await save_user(message, is_start=True)
     if status is None:
-        # Do not send Telegram API calls from the old runner once handoff begins.
+        return
+    if status == "switching":
+        await message.answer("🔄 SkyGen is switching servers. Please wait a moment and try again.")
         return
     user = message.from_user
     name = (user.first_name or "there") if user else "there"
@@ -444,6 +478,9 @@ async def command_ping(message: Message):
     status = await save_user(message)
     if status is None:
         return
+    if status == "switching":
+        await message.answer("🔄 SkyGen is switching servers. Please wait a moment.")
+        return
     sent = await message.answer("🏓 Measuring...")
     latency = (time.perf_counter() - started) * 1000
     await asyncio.sleep(0.5)
@@ -461,6 +498,9 @@ async def command_ping(message: Message):
 async def command_id(message: Message):
     status = await save_user(message)
     if status is None:
+        return
+    if status == "switching":
+        await message.answer("🔄 SkyGen is switching servers. Please wait a moment.")
         return
     if message.from_user:
         await message.answer(f"🆔 Your Telegram user ID: {message.from_user.id}")
@@ -490,24 +530,58 @@ async def stop_at_hard_limit():
 
 
 async def handoff_task():
-    global HANDOFF_STARTED, TARGET_RUN_ID, PREPARED_FOR_HANDOFF
+    """Prepare the child in the background while the parent keeps serving commands."""
+    global HANDOFF_STARTED, TARGET_RUN_ID
     wait_seconds = max(0, HANDOFF_AT_SECONDS - (time.monotonic() - START_TIME))
     await asyncio.sleep(wait_seconds)
-    HANDOFF_STARTED = True
-    logging.info("SKYGEN_HANDOFF_BEGIN writes_paused=true")
+    logging.info("SKYGEN_HANDOFF_PREPARE_BEGIN polling_remains_active=true")
 
     snapshot = None
     timeout = aiohttp.ClientTimeout(total=45, connect=15, sock_read=30)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as http:
-            snapshot = await create_snapshot()
-            await upload_database(http, snapshot)
+            # Dispatch early, but do NOT pause handlers or polling yet.
             await write_handoff_status(http, "dispatching", "", RUN_ID)
             TARGET_RUN_ID = await dispatch_next_run(http)
             await write_handoff_status(http, "handoff_requested", TARGET_RUN_ID, RUN_ID)
             logging.info("SKYGEN_HANDOFF_TARGET run_id=%s", TARGET_RUN_ID)
 
             hard_deadline = START_TIME + RUN_SECONDS
+            cutover_at = START_TIME + (RUN_SECONDS - 20)
+            child_prepared = False
+
+            # Keep the old bot fully operational while GitHub queues and starts the child.
+            while time.monotonic() < cutover_at:
+                run = await get_workflow_run(http, TARGET_RUN_ID)
+                run_status = run.get("status", "unknown")
+                if run_status in ("failure", "cancelled", "timed_out") or (
+                    run_status == "completed" and run.get("conclusion") != "success"
+                ):
+                    raise RuntimeError(
+                        f"Child run failed before cutover: status={run_status}, conclusion={run.get('conclusion')}"
+                    )
+                status = await read_handoff_status(http)
+                child_prepared = (
+                    status.get("state") == "ready_for_final_sync"
+                    and str(status.get("target_run_id")) == TARGET_RUN_ID
+                    and str(status.get("parent_run_id")) == RUN_ID
+                )
+                if child_prepared and run_status == "in_progress":
+                    try:
+                        if await verify_run_job(http, TARGET_RUN_ID):
+                            logging.info("SKYGEN_CHILD_PREPARED run_id=%s; parent keeps polling until cutover", TARGET_RUN_ID)
+                    except Exception as error:
+                        logging.warning("Could not verify child job yet (%s).", type(error).__name__)
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+            # Last short cutover window: pause DB writes, commit a final snapshot, and
+            # only then let the child load that exact snapshot and take over polling.
+            HANDOFF_STARTED = True
+            logging.info("SKYGEN_HANDOFF_CUTOVER_BEGIN writes_paused=true")
+            snapshot = await create_snapshot()
+            await upload_database(http, snapshot)
+            await write_handoff_status(http, "final_snapshot_ready", TARGET_RUN_ID, RUN_ID)
+
             while time.monotonic() < hard_deadline:
                 run = await get_workflow_run(http, TARGET_RUN_ID)
                 run_status = run.get("status", "unknown")
@@ -519,8 +593,8 @@ async def handoff_task():
                     return
 
                 status = await read_handoff_status(http)
-                prepared = (
-                    status.get("state") == "prepared"
+                child_ready = (
+                    status.get("state") == "child_ready"
                     and str(status.get("target_run_id")) == TARGET_RUN_ID
                     and str(status.get("parent_run_id")) == RUN_ID
                 )
@@ -531,35 +605,27 @@ async def handoff_task():
                     except Exception as error:
                         logging.warning("Could not verify child job yet (%s).", type(error).__name__)
 
-                if run_status == "in_progress" and prepared and job_active:
-                    # Logs are checked when GitHub exposes an in-progress archive. The app-written
-                    # prepared marker plus live job step are authoritative if logs are not yet downloadable.
-                    logs_ok = await inspect_run_logs(http, TARGET_RUN_ID)
-                    if not logs_ok:
-                        logging.info("Child log archive not available/complete yet; prepared marker and live job step verified.")
-                    logging.info("SKYGEN_CHILD_READY run_id=%s; stopping old poller before child starts polling", TARGET_RUN_ID)
+                if run_status == "in_progress" and child_ready and job_active:
+                    logging.info("SKYGEN_CHILD_READY run_id=%s; stopping parent poller for exclusive Telegram polling", TARGET_RUN_ID)
                     try:
                         await dp.stop_polling()
                     except RuntimeError:
                         pass
-                    try:
-                        await write_handoff_status(http, "parent_stopped", TARGET_RUN_ID, RUN_ID)
-                    except Exception:
-                        logging.exception("Could not write parent-stopped marker; child will wait for this run to complete.")
+                    await write_handoff_status(http, "parent_stopped", TARGET_RUN_ID, RUN_ID)
                     return
 
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(1)
 
-            logging.warning("Handoff deadline reached; stopping old poller at the 10-minute limit.")
+            logging.warning("Handoff reached the 10-minute test limit; stopping parent poller.")
             try:
                 await dp.stop_polling()
             except RuntimeError:
                 pass
     except Exception:
-        logging.exception("SKYGEN_HANDOFF_FAILED; current run will remain until its 10-minute limit.")
-        # If dispatch never succeeded, resume commands; always enforce the hard limit.
-        if not TARGET_RUN_ID:
-            HANDOFF_STARTED = False
+        logging.exception("SKYGEN_HANDOFF_FAILED; current run remains active until its hard limit.")
+        # If handoff preparation fails, keep serving commands until the hard limit.
+        # The child will wait for this run to complete and refresh the latest DB snapshot.
+        HANDOFF_STARTED = False
         await stop_at_hard_limit()
     finally:
         if snapshot:
@@ -589,8 +655,8 @@ async def main():
 
         if PARENT_RUN_ID:
             async with aiohttp.ClientSession(timeout=api_timeout) as http:
-                await write_handoff_status(http, "prepared", RUN_ID, PARENT_RUN_ID)
-                logging.info("SKYGEN_HANDOFF_STATE state=prepared target_run_id=%s parent_run_id=%s", RUN_ID, PARENT_RUN_ID)
+                await write_handoff_status(http, "ready_for_final_sync", RUN_ID, PARENT_RUN_ID)
+                logging.info("SKYGEN_HANDOFF_STATE state=ready_for_final_sync target_run_id=%s parent_run_id=%s", RUN_ID, PARENT_RUN_ID)
                 await child_wait_for_parent_to_stop(http)
 
         logging.info("SKYGEN_POLLING_START run_id=%s", RUN_ID)
