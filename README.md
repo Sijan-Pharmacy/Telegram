@@ -1,48 +1,44 @@
-# SkyGen — SQLite persistence and 10-minute handoff test
+# SkyGen Telegram Bot — Modular Edition
 
-This package replaces the old repository-backup bot. It has only these commands:
+This edition separates Telegram commands from the process lifecycle while preserving the existing GitHub Actions + private GitHub SQLite handoff design.
 
-- `/start` — records the Telegram user in SQLite
-- `/ping` — response-time check and last-seen update
-- `/id` — shows and records the user's Telegram ID
+## Files
 
-## How the 10-minute test works
+- `bot.py` — Telegram handlers only: `/start`, `/ping`, `/id`, and the handoff notice fallback.
+- `runtime.py` — SQLite persistence, GitHub API, backup snapshots, workflow dispatch/monitoring, and parent/child handoff.
+- `lifecycle.py` — small Python entry point for the runtime.
+- `start.sh` — starts the bot in the foreground (suitable for GitHub Actions and VPS use).
+- `stop.sh` — requests a graceful SIGTERM on a VPS; runtime attempts to upload a final SQLite snapshot. In GitHub Actions, stop/cancel the workflow from the Actions UI.
+- `.github/workflows/run.yml` — GitHub Actions workflow.
+- `requirements.txt` — Python dependencies.
 
-1. Start the first run manually from **Actions → Run SkyGen Telegram Bot → Run workflow**.
-2. The runner reads `database.sqlite` from a private database repository. If that repository does not exist, the bot creates it under the GitHub account associated with `GH_PAT`.
-3. The bot handles commands and writes user records to its local SQLite file.
-4. At 8 minutes, it pauses database writes, makes a consistent SQLite snapshot, commits it to the private database repository, and calls the GitHub API to dispatch the next workflow.
-5. The new runner downloads and validates the committed SQLite file before starting Telegram polling.
-6. When Telegram reports a polling conflict to the old runner, the old process exits. If no conflict arrives, the old process stops at 10 minutes.
+## Production timing
 
-The workflow intentionally has only `workflow_dispatch` as a trigger. That avoids an ordinary code push unexpectedly starting a second runner against a stale database. After changing code, push it and manually start the workflow again.
+- `RUN_SECONDS = 340 * 60`: 5 hours 40 minutes.
+- `HANDOFF_AT_SECONDS = 335 * 60`: dispatch the next workflow after 5 hours 35 minutes.
+- `CUTOVER_BUFFER_SECONDS = 60`: start the final database snapshot 1 minute before the 5h40m deadline, leaving roughly 4 minutes for the next run to initialize before the final sync.
+- `POLL_INTERVAL_SECONDS = 3`: workflow status check interval.
+
+The Actions job timeout remains 350 minutes, giving a 10-minute outer margin beyond the bot's 340-minute lifecycle. Do not reduce it below `RUN_SECONDS` plus a reasonable startup/cleanup margin.
 
 ## Required GitHub Actions secrets
 
-Open the **bot repository** → **Settings → Secrets and variables → Actions** and add:
+- `TELEGRAM_BOT_TOKEN` — Telegram bot token.
+- `GH_PAT` — a GitHub token with access to the bot repository's Actions workflows and the private database repository's contents. It should have only the permissions needed for these tasks.
+- `DB_REPO_NAME` — private database repository name (optional; defaults to `SkyGen-Database`).
 
-| Secret | Value |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Token from BotFather |
-| `GH_PAT` | GitHub Personal Access Token |
-| `DB_REPO_NAME` | Repository name for SQLite, e.g. `SkyGen-Database` |
+The database repository must remain private. The bot may create it if the token has permission. The workflow must be manually started once; subsequent runs are dispatched by the current run.
 
-`DB_REPO_NAME` is a repository name only, not a URL or `owner/repo`. The bot discovers the PAT owner's GitHub username. If that private repository does not exist, the bot creates it automatically. If it already exists, it must be private.
+## VPS use
 
-### Token permissions
+```bash
+python -m pip install -r requirements.txt
+chmod +x start.sh stop.sh
+./start.sh
+```
 
-For a **classic PAT**, the simplest setup for a private bot repository and private database repository is generally `repo` plus `workflow`. This is broad access; protect the token like a password and never print it in logs. Prefer a fine-grained PAT with only the required access if you can grant access to both repositories and workflow dispatch.
+`start.sh` runs in the foreground. For background service management, use a proper supervisor such as systemd rather than `nohup` for a production deployment. `stop.sh` works with a process started by `start.sh` only if the PID file remains available.
 
-The PAT owner must have permission to access the repository containing this workflow. The database repository is created under the PAT owner's account.
+## Important operational note
 
-## Important limitations
-
-- This is a **10-minute test cycle**, not a production uptime guarantee.
-- `409 Conflict` is a useful signal that another long-polling process has taken over, but it is not a formal handover acknowledgement.
-- The database snapshot is uploaded **before** dispatching the next run. The next run downloads it before polling. Database writes are paused during handoff to reduce the chance of lost updates.
-- Commands arriving during the brief handoff window may receive a “switching runners” reply and should be retried.
-- GitHub Actions does not guarantee immediate runner startup, so a short interruption can occur.
-- If a workflow dispatch fails, the current run logs the failure and stops at 10 minutes. Check Actions logs and manually run the workflow if the chain stops.
-- SQLite contains Telegram user IDs, usernames, first names, timestamps, and start counts. Do not store sensitive tokens in it.
-- Keep the database repository private. Do not add the SQLite file to the public bot repository.
-- The current test uses an 8-minute handoff and a 10-minute hard stop. Change `HANDOFF_AT_SECONDS` and `RUN_SECONDS` in `bot.py` for a different test window.
+The same Telegram bot token should have only one active long poller. The handoff status protocol tries to ensure the child loads the final SQLite snapshot and confirms readiness before the parent exits. A short race or service interruption is still possible if GitHub queues the next workflow, API calls fail, or the child does not become ready before the deadline. GitHub Actions is not a substitute for a continuously running production VPS.
